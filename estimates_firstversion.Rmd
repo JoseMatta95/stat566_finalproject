@@ -1,0 +1,146 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-05-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+
+```{r}
+library(tidyverse)
+library(MatchIt)
+library(mice)
+library(MatchIt)
+library(cobalt)
+```
+
+```{r}
+df_work = read.csv("./data/df_work.csv")
+```
+
+# Standarization
+## OLS
+```{r}
+model_ols <- glm(heart_attack_incident ~ statin, data = df_work, family = binomial)
+
+jtools::summ(model_ols, exp = T)
+```
+
+
+```{r}
+model_adj <- glm(heart_attack_incident ~ statin + diet + smoking_stat + health_insurace + physical_act +
+                   income + bmxbmi + age + sex + educ, data = df_work, family = binomial)
+
+jtools::summ(model_adj, exp = T)
+```
+
+## Set counterfactuals
+```{r}
+model_a1 <- predict(model_adj, newdata = df_work %>% mutate(statin = 1), type = "response")
+model_a0 <- predict(model_adj, newdata = df_work %>% mutate(statin = 0), type = "response")
+```
+
+## mean difference
+```{r}
+mean(model_a1, na.rm = T) / mean(model_a0, na.rm = T)
+```
+
+```{r}
+ate_statin <- function(data, indx) {
+  
+  d <- data[indx, ]
+  
+  model_Y <- glm(heart_attack_incident ~ statin + diet + smoking_stat + health_insurace + physical_act +
+                   income + bmxbmi + age + sex + educ, data = d, family = binomial)
+  
+  d1 <- d %>% mutate(statin  = 1)
+  
+  
+  d0 <- d %>% mutate(statin  = 0)
+  
+  Y_a_1 <- predict(model_Y, newdata = d1, type = "response")
+  Y_a_0 <- predict(model_Y, newdata = d0, type = "response")
+  
+  ate <- mean(Y_a_1, na.rm = T)/ mean(Y_a_0, na.rm = T)
+  
+  return(ate)
+}
+
+set.seed(123)
+
+boot_ate_statin <- boot::boot(data = df_work, statistic = ate_statin, R = 999)
+
+#boot_ate_smoke$t0
+quantile(boot_ate_statin$t, c(.025,.975))
+```
+
+# IPW: there are missing values --> I tried MICE imputation
+
+## MICE
+```{r}
+df_work_exp <- df_work %>%  select(statin,diet,smoking_stat,health_insurace,physical_act,income,bmxbmi,age,sex,educ)
+
+
+imp <- mice(df_work_exp, m = 5, method = "pmm", seed = 123)
+```
+
+## imputed datasets  
+```{r}
+df1 <- complete(imp, 1)
+df2 <- complete(imp, 2)
+df3 <- complete(imp, 3)
+df4 <- complete(imp, 4)
+df5 <- complete(imp, 5)
+```
+
+```{r}
+ipw_mice <- function(data,data2){
+
+  data$heart_attack_incident <- data2$heart_attack_incident
+  
+  model_ps <- glm(statin ~ diet + smoking_stat + health_insurace + physical_act +
+                    income + bmxbmi + age + sex + educ,
+
+                  data = data, family = binomial)
+
+
+  data$ps <- predict(model_ps, type = "response")
+
+  p_statin <- mean(data$statin == 1, na.rm = TRUE)
+
+
+  data <- data %>%
+    mutate(
+      w_stab = case_when(
+        statin == 1 ~ p_statin / ps,
+        statin == 0 ~ (1 - p_statin) / (1 - ps),
+        TRUE ~ NA
+      )
+    )
+
+  model <-jtools::summ(glm(heart_attack_incident ~ statin, data = data , weights = w_stab, family = binomial), exp =T)[[1]][2,]
+
+  model
+  
+  
+}
+```
+
+## IPW for each imputed datasets 
+
+```{r}
+table<-map_df(
+  .x = list(df1,df2,df3,df4,df5),
+  .f = ~ipw_mice(data = .x, data2 = df_work)
+)
+
+table %>% 
+  mutate(
+    dfs = c("df1","df2","df3","df4","df5")
+  )
+
+```
+

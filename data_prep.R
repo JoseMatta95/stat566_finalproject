@@ -100,6 +100,17 @@ demo_conf <-
     income = indfmpir
   )
 
+### diet
+
+diet_conf<-
+  read_nhanes("dbq") %>% 
+  filter(year == 2015) %>% 
+  select(year,seqn,dbq700) %>% 
+  rename(
+    diet = dbq700
+  )
+
+
 ### High blood pressure 
 
 bloodpress_conf <-
@@ -194,6 +205,18 @@ insurance_conf<-
     year,seqn,health_insurace
   )
 
+## Proximity health care
+
+proximity_conf <-
+  read_nhanes("huq") %>% 
+  filter(year == 2015) %>% 
+  mutate(
+    huq030 = ifelse(huq030 == "There is more than one place" | huq030 == "Yes","Yes","No")
+  ) %>% 
+  select(
+    year,seqn,huq030
+  ) 
+
 # Final data ----
 
 df_work<-
@@ -206,6 +229,8 @@ df_work<-
   left_join(smoking_comf) %>% 
   left_join(phys_conf) %>% 
   left_join(insurance_conf) %>% 
+  left_join(proximity_conf) %>% 
+  left_join(diet_conf) %>% 
   
   mutate(
     statin_start = age-(statin_days/365),
@@ -216,7 +241,12 @@ df_work<-
     )
   ) %>%
   filter(
-    !health_insurace %in% c("Don't know","Refused")
+    !health_insurace %in% c("Don't know","Refused"),
+    diet != "Don't know"
+  ) %>% 
+  mutate(
+    statin = as.factor(statin),
+    educ = as.numeric(factor(educ))
   )
 
-
+write.csv(df_work,"./data/df_work.csv",row.names = F)
