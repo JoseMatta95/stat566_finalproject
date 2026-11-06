@@ -1,0 +1,888 @@
+---
+title: "Estimating the Causal Effect of Statin Therapy on Heart Attack Incidence"
+author: "Isabella Chen, Jose Matta-Chuquisapon, Kristen Engel"
+date: "2026-05-26"
+output:
+  pdf_document:
+    toc: false
+  html_document:
+    toc: false
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+```{r}
+library(tidyverse)
+library(haven)
+# install.packages("pak")
+# pak::pak("kyleGrealis/nhanesdata")
+library(nhanesdata)
+library(janitor)
+library(MatchIt)
+library(mice)
+library(cobalt)
+library(dagitty)
+library(EValue)
+set.seed(2026)
+```
+
+# Data preparation
+```{r} 
+# across all variables in data preparation, shared manipulations comprise 1) reading the relevent NHANES table from the nhanesdata R package and 2) subsetting the data to the 2015 survey cycle to reflect project scope where the variable seqn reflects participant IDs and the variable year indicates the survey cycle
+```
+
+## Statins
+
+```{r}
+rxq_rx  <-
+  read_nhanes("rxq_rx") %>% # table: rxq_rx , Prescription Medications data file
+  clean_names() %>% # standardize text for regex
+  filter(year == 2015) %>%
+  mutate(
+    statins_use    = as.integer(str_detect(rxddrug, regex('atorvastatin|simvastatin|fluvastatin|lovastatin|
+                                             pitavastatin|pravastatin|rosuvastatin', ignore_case = T))), # identify statin use using regular expressions
+  ) %>%
+  select(year, seqn, statins_use, rxddays) %>% # extract relevant data mapping statin use across time (rxddays = Number of days taken medicine, year) and participant ID (seqn)
+  group_by(year, seqn) %>%
+  summarise(
+    statin = as.integer(any(statins_use == 1, na.rm = TRUE)), # create treatment variable where a participant is included if any of their prescriptsion are a statin
+
+    statin_days = ifelse(
+      any(statins_use == 1, na.rm = TRUE),
+      max(rxddays[statins_use == 1], na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  ) # establish the length of time in treatement given the maximum number of days taking a statin medication
+table(rxq_rx$statin) # examine distribution of treatment in the full 2015 data
+```
+
+```{r}
+# use to filter previous diagnosis of hypercholesterolemia
+bpq<- read_nhanes("bpq") %>%  # table: bpq, Blood Pressure & Cholesterol data file
+  filter(year == 2015) %>%
+  select(year,seqn,bpq080) %>% # bpq080: Doctor told you - high cholesterol level
+  filter(bpq080 == "Yes") # extract relevant data of participants with a history of high cholestorol
+
+# final exposure data --> all data have to fit this
+exposure_df<-
+bpq %>%
+  left_join(rxq_rx) # create treatment data, which only includes participants who have a clinical diagnosis of high cholesterol and includes the treatment indicator of 0 (control) or 1 (exposure)
+```
+
+## CVD and mortality
+
+```{r}
+mcq     <- read_nhanes("mcq") # table: mcq, Medical Conditions data file
+
+cvd <- mcq %>%
+  filter(year == 2015) %>%
+  select(seqn, year, mcq160e, mcq180e) %>% # mcq160e: Ever told you had heart attack, mcq180e: Age when told you had heart attack
+  mutate(
+    heart_attack = ifelse(mcq160e == "Yes", 1, 0), # create an outcome indicator of 0 (no heart attack diagnosis) or 1 (prior heart attack diagnosis)
+    age_first_ha = mcq180e # create a variable indicating the participant's age of heart attack diagnosis
+  ) %>%
+  select(year, seqn, heart_attack, age_first_ha) # extract relevant heart attack data
+
+# Final data exposure + outcome
+final_df<-
+  exposure_df %>%
+  left_join(cvd) # add participant's relevant heart attack outcome data to the treatment data to create final data
+```
+
+## Confounders
+
+```{r}
+# Age, gender, Income, edu level
+demo_conf <-
+  read_nhanes("demo") %>% # table: demo, Demographic Variables
+  select(year, seqn, ridageyr, riagendr, dmdeduc2, indfmpir) %>% # ridageyr: Age at Screening, riagendr: Gender, with Non-Hispanic Asian Category, dmdeduc2: Education level - Adults 20+, indfmpir: Ratio of family income to poverty
+  filter(year == 2015) %>%
+  mutate(
+    dmdeduc2 = case_when(
+      dmdeduc2 == "Less than 9th grade" ~ "less_than_9th",
+      dmdeduc2 == "9-11th grade (Includes 12th grade with no diploma)" ~ "9th_to_11th",
+      dmdeduc2 == "High school graduate/GED or equivalent" ~ "high_school",
+      dmdeduc2 == "Some college or AA degree" ~ "some_college",
+      dmdeduc2 == "College graduate or above" ~ "college_or_above",
+      dmdeduc2 %in% c("Don't know", "Refused") ~ NA_character_,
+      TRUE ~ NA_character_
+    ), # simply education naming conventions
+
+    dmdeduc2 = factor(
+      dmdeduc2,
+      levels = c(
+        "less_than_9th",
+        "9th_to_11th",
+        "high_school",
+        "some_college",
+        "college_or_above"
+      ),
+      ordered = TRUE
+    ) # classify recoded education as ordinal
+  ) %>%
+  rename(
+    age = ridageyr,
+    gender = riagendr,
+    education = dmdeduc2,
+    income = indfmpir
+  ) # simply variable names
+
+# Diet
+diet_conf<-
+  read_nhanes("dbq") %>% # table: dbq, Diet Behavior & Nutrition
+  filter(year == 2015) %>%
+  select(year,seqn,dbq700) %>% # dbq700: How healthy is the diet
+  rename(
+    diet = dbq700
+  ) # simply variable name
+
+# High blood pressure
+bloodpress_conf<-
+  read_nhanes("bpq") %>% # table: bpq, Blood Pressure & Cholesterol
+  filter(year == 2015) %>%
+  select(year,seqn,bpq020) %>% # bpq020: ever told you had high blood pressure
+  rename(
+    hypertension = bpq020
+  ) # simply variable name
+
+# Diabetes / blood sugar
+diabetes_conf<-
+  read_nhanes("ghb") %>% # table: ghb, Glycohemoglobin
+  filter(year == 2015) %>%
+  mutate(
+    blood_sugar = ifelse(lbxgh >=6.5,1,0) # lbxgh: Glycohemoglobin, set diabetes indicator to 1 if glycohemoglobin exceeds 6.5 A1C threshold for diabetes, 0 if not
+  ) %>%
+  select(
+    year,seqn,blood_sugar
+  ) # select relevant participant blood_sugar content
+
+# Serum Cholesterol
+chol_conf<-
+  read_nhanes("tchol") %>% # table: tchol, Cholesterol - Total
+  filter(year == 2015) %>%
+  rename(
+    cholesterol = lbxtc # simplify variable name for lbxtc: Total Cholesterol (mg/dL)
+  ) %>%
+  select(
+    year,seqn,cholesterol
+  )
+
+# bmi
+imc_conf<-
+  read_nhanes("bmx") %>% # table: bmx, Body Measures
+  select(
+    year,seqn,bmxbmi # extract relevant participant bmi data, bmi: Body Mass Index (kg/m**2)
+  ) %>%
+  filter(
+    year == 2015
+  )   %>% rename(
+    bmi = bmxbmi
+  ) # simply variable name
+
+# Smoking status
+smoking_comf <-
+  read_nhanes("smq") %>%  # table: smq, Smoking - Cigarette Use
+  filter(
+    year == 2015
+  ) %>%
+  mutate(
+    smoking_status = case_when( # smq020: # Smoked at least 100 cigarettes in life, smq040: Do you now smoke cigarettes?
+      smq020 == "No" ~ 0, # Never
+      smq020=="Yes" & smq040=="Not at all" ~ 1, # Former
+      smq020=="Yes" & smq040 %in% c("Every day","Some days") ~ 2, # Current
+      T ~ NA
+    ) # recode to simply as non-smoker, former smoker or current smoker
+  ) %>%
+  select(year,seqn,smoking_status) # extract relevant participant smoking status data
+
+# Physical activity
+phys_conf<-
+  read_nhanes("paq") %>% # table: paq, Physical Activity
+  filter(year ==2015) %>%
+  select(year,seqn, pad680) %>% # extract extract relevant participant physical activity data, pad680: minutes sedentary activity
+  rename(
+    physical_activity = pad680
+  ) # simply variable name
+
+# Health insurance
+insurance_conf<-
+  read_nhanes("hiq") %>% # table: hiq, Health Insurance
+  filter(
+    year == 2015
+  ) %>%
+  rename(
+    health_insurance = hiq011 ) %>% # simplify variable name, hiq011: Covered by health insurance
+  select(
+    year,seqn,health_insurance
+  ) # extract relevant participant health insurance data
+
+# Proximity health care
+proximity_conf <-
+  read_nhanes("huq") %>% # table: huq, Hospital Utilization & Access to Care
+  filter(year == 2015) %>%
+  mutate(
+    huq030 = ifelse(huq030 == "There is more than one place" | huq030 == "Yes","Yes","No")
+  ) %>% # identify when participants have indicated at least one place to go for healthcare, huq030: Routine place to go for healthcare
+  select(
+    year,seqn,huq030 ) %>% # extract relevant participant healthcare proximity data
+  rename(
+    proximity = huq030
+  ) # simply variable name
+```
+
+## Final data
+
+```{r}
+df_work<-
+  final_df %>% # add participant's relevant covariate data to final dataframe
+  left_join(demo_conf) %>%
+  left_join(bloodpress_conf) %>%
+  left_join(diabetes_conf) %>%
+  left_join(chol_conf) %>%
+  left_join(imc_conf) %>%
+  left_join(smoking_comf) %>%
+  left_join(phys_conf) %>%
+  left_join(insurance_conf) %>%
+  left_join(proximity_conf) %>%
+  left_join(diet_conf) %>%
+
+  mutate(
+    statin_start = age-(statin_days/365), # approximate age of statin initiaiton
+    heart_attack_incident = case_when(
+      statin == 1 ~ as.integer(heart_attack == 1 & age_first_ha > statin_start),
+      statin == 0 ~ heart_attack,
+      TRUE        ~ NA_integer_
+    ) # adjust treatment indicator so that only statin use that preceeds a heart attack diagnosis is considered
+  ) %>%
+  filter(
+    !health_insurance %in% c("Don't know","Refused"),
+    diet != "Don't know"
+  ) %>% # exclude respondents with vague or missing data on covariates
+  mutate(
+    statin = as.factor(statin),
+    education = as.numeric(factor(education)) # convert treatment to binary factor and education to numeric for evaluation
+  )
+
+write.csv(df_work,"df_work.csv",row.names = F) # create data file
+```
+
+
+```{r}
+df_work_age_filter<-
+  df_work %>%
+  filter(
+    age > 50
+  ) # subset the final data to only include older adults
+```
+
+### Create DAG for central analysis, reflecting pre-treatment variables
+
+```{r}
+# primary analysis DAG: pre-treatment confounders only
+g <- dagitty(' 
+dag {
+bb="-5,-3,9,3"
+
+income                 [pos="-5,-1"]
+
+education      [pos="-3,0.5"]
+health_insurance     [pos="-1,-1"]
+proximity [pos="-3,2"]
+
+age                    [pos="-5,-2"]
+gender                 [pos="-5,1"]
+
+physical_activity        [pos="3,-2"]
+smoking_status       [pos="1,-0.5"]
+
+hypertension           [pos="4,1.5"]
+
+statin                [pos="6,0"]
+
+heart_attack_incident         [pos="9,0"]
+
+income -> education
+income -> health_insurance
+income -> proximity
+
+age -> education
+age -> health_insurance
+age -> physical_activity
+
+age -> hypertension
+
+age -> statin
+age -> heart_attack_incident
+
+gender -> heart_attack_incident
+gender -> hypertension
+gender -> statin
+
+education -> smoking_status
+education -> proximity
+
+education -> statin
+education -> heart_attack_incident
+
+health_insurance -> hypertension
+health_insurance -> statin
+health_insurance -> heart_attack_incident
+
+physical_activity -> smoking_status
+physical_activity -> hypertension
+
+physical_activity -> statin
+physical_activity -> heart_attack_incident
+
+smoking_status -> heart_attack_incident
+
+blood_sugar -> heart_attack_incident
+hypertension -> heart_attack_incident
+
+statin -> heart_attack_incident
+}
+')
+
+plot(g)
+
+```
+### Create DAG for sensitivity analysis, reflecting post-treatment variable as pre-treatment variables
+```{r}
+# sensitivity analysis DAG: includes post-treatment variables (cholesterol, bmi, diet, blood_sugar) treated as pre-treatment
+g_full <- dagitty(' 
+dag {
+bb="-0.5,-0.5,0.5,0.5"
+blood_sugar [pos="0.063,0.259"]
+education [pos="-0.139,0.179"]
+health_insurance [pos="0.062,-0.325"]
+heart_attack_incident [outcome,pos="0.220,-0.123"]
+physical_activity [pos="0.157,-0.333"]
+proximity [pos="-0.253,0.151"]
+cholesterol [pos="0.038,-0.194"]
+smoking_status [pos="-0.047,-0.295"]
+bmi [pos="-0.141,0.036"]
+age [pos="-0.065,0.091"]
+diet [pos="-0.207,-0.263"]
+gender [pos="0.141,0.079"]
+hypertension [pos="0.031,0.127"]
+income [pos="-0.243,-0.114"]
+statin [exposure,pos="-0.139,-0.114"]
+blood_sugar -> heart_attack_incident [pos="0.206,0.185"]
+blood_sugar -> hypertension
+education -> blood_sugar [pos="-0.076,0.271"]
+education -> proximity
+education -> smoking_status [pos="-0.315,-0.153"]
+education -> bmi
+education -> statin [pos="-0.224,-0.018"]
+health_insurance -> heart_attack_incident [pos="0.195,-0.243"]
+health_insurance -> cholesterol
+health_insurance -> hypertension [pos="0.116,-0.088"]
+health_insurance -> statin
+physical_activity -> blood_sugar [pos="0.178,-0.079"]
+physical_activity -> heart_attack_incident [pos="0.215,-0.255"]
+physical_activity -> cholesterol
+physical_activity -> smoking_status [pos="0.068,-0.423"]
+physical_activity -> hypertension [pos="0.147,-0.072"]
+physical_activity -> statin [pos="-0.116,-0.427"]
+proximity -> blood_sugar [pos="-0.165,0.332"]
+proximity -> heart_attack_incident [pos="0.040,0.347"]
+proximity -> cholesterol [pos="-0.142,-0.044"]
+proximity -> hypertension [pos="-0.089,0.131"]
+cholesterol -> heart_attack_incident
+cholesterol -> hypertension
+smoking_status -> heart_attack_incident [pos="0.151,-0.283"]
+smoking_status -> cholesterol
+smoking_status -> bmi [pos="-0.212,-0.188"]
+smoking_status -> diet
+smoking_status -> hypertension
+bmi -> blood_sugar [pos="-0.114,0.223"]
+bmi -> heart_attack_incident
+bmi -> cholesterol
+bmi -> statin
+age -> blood_sugar
+age -> education
+age -> health_insurance [pos="-0.052,-0.159"]
+age -> heart_attack_incident
+age -> physical_activity [pos="0.115,-0.068"]
+age -> cholesterol
+age -> smoking_status
+age -> bmi
+age -> hypertension
+age -> statin
+diet -> cholesterol
+diet -> bmi [pos="-0.198,-0.084"]
+diet -> hypertension [pos="-0.055,-0.139"]
+gender -> heart_attack_incident
+gender -> cholesterol
+gender -> bmi
+gender -> hypertension
+gender -> statin
+hypertension -> heart_attack_incident
+income -> education [pos="-0.252,0.060"]
+income -> health_insurance [pos="-0.132,-0.425"]
+income -> proximity [pos="-0.269,0.021"]
+income -> diet
+statin -> heart_attack_incident
+statin -> cholesterol
+}
+
+')
+
+plot(g_full)
+```
+
+```{r}
+primCovariates <- adjustmentSets(
+  g,
+  exposure = "statin",
+  outcome = "heart_attack_incident"
+) # retrieve primaryCovariates analysis adjustment set
+print("primary covariates:")
+primCovariates
+
+sensCovariates <- adjustmentSets(
+  g_full,
+  exposure = "statin",
+  outcome = "heart_attack_incident"
+) # retrieve sensitivity analysis adjustment set
+ print("sensitivity covariates:")
+ sensCovariates
+```
+
+# Dataset: We use the age > 50 dataset for our estimation
+```{r}
+# age-filtered (age > 50) and imputed the dataset.
+df_work_exp_age_filter <- df_work_age_filter %>%  select(statin,bmi,age,education,health_insurance,physical_activity,gender)
+
+# Perform multiple imputation using predictive mean matching (PMM)
+# to address missing covariate values while preserving plausible
+# observed data distributions.
+imp <- mice(df_work_exp_age_filter, m = 5, method = "pmm", seed = 123)
+
+# Imputed datasets
+df1 <- complete(imp, 1) 
+df2 <- complete(imp, 2)
+df3 <- complete(imp, 3)
+df4 <- complete(imp, 4)
+df5 <- complete(imp, 5)
+```
+
+
+# Estimation
+
+## Estimation 1
+## Use standarization to find the risk ratio
+```{r}
+g_formula_function <- function(data, formula){ # g-computation estimator returning RR with 95% CI via percentile bootstrap
+
+  model_adj <- glm(formula, data = data, family = binomial) # fit outcome model adjusted for covariates in formula
+
+model_a1 <- predict(model_adj, newdata = data %>% mutate(statin = factor(1, levels = levels(statin))), type = "response") # predicted P(Y=1|A=1, L) under universal treatment
+model_a0 <- predict(model_adj, newdata = data %>% mutate(statin = factor(0, levels = levels(statin))), type = "response") # predicted P(Y=1|A=0, L) under universal control
+
+estimate <- mean(model_a1, na.rm = T) / mean(model_a0, na.rm = T) # marginal risk ratio: E[Y(1)] / E[Y(0)]
+
+ate_statin <- function(data, indx) { # bootstrap resampling function for ATE estimation
+
+  d <- data[indx, ]
+
+  model_Y <- glm(formula, data = d, family = binomial) # refit outcome model on bootstrap sample
+
+  d1 <- d %>% mutate(statin  = factor(1, levels = levels(statin))) # counterfactual: everyone treated
+
+  d0 <- d %>% mutate(statin  = factor(0, levels = levels(statin))) # counterfactual: no one treated
+
+  Y_a_1 <- predict(model_Y, newdata = d1, type = "response")
+  Y_a_0 <- predict(model_Y, newdata = d0, type = "response")
+
+  ate <- mean(Y_a_1, na.rm = T)/ mean(Y_a_0, na.rm = T) # bootstrap RR estimate
+
+  return(ate)
+}
+
+boot_ate_statin <- boot::boot(data = data, statistic = ate_statin, R = 999) # run 999 bootstrap iterations
+
+#boot_ate_smoke$t0
+ic_ate <- quantile(boot_ate_statin$t, c(.025,.975)) # percentile 95% CI
+
+return(list(
+    RR = estimate,
+    CI = ic_ate
+  ))
+
+}
+```
+
+## Formula 1: with bmi and df_work age-filtered
+```{r}
+stdr_bmi <- g_formula_function(data = df_work_age_filter, formula = heart_attack_incident ~ statin  + bmi + age + education + health_insurance + physical_activity + gender)
+stdr_bmi
+```
+
+## Formula 2: without bmi and df_work age-filtered
+```{r}
+stdr_nobmi <- g_formula_function(data = df_work_age_filter, formula = heart_attack_incident ~ statin  + age + education + health_insurance + physical_activity + gender)
+stdr_nobmi
+```
+
+----------------------
+
+# Estimation 2
+## Use IPW to find the risk ratio
+```{r}
+# Pool treatment effect estimates across the 5 imputed datasets
+# using Rubin's rules to account for both within-imputation and
+# between-imputation variability.
+get_pooled <- function(estimates, ses) {
+  m  <- length(estimates)
+  Q  <- mean(estimates)
+  W  <- mean(ses^2)
+  B  <- var(estimates)
+  SE <- sqrt(W + (1 + 1/m) * B)
+  c(Estimate = round(Q, 4), SE = round(SE, 4),
+    CI_lower  = round(Q - 1.96 * SE, 4),
+    CI_upper  = round(Q + 1.96 * SE, 4))
+}
+```
+
+
+
+```{r}
+# IPW estimates returning log(RR) and SE(logRR) for age > 50
+ipw_mice <- function(data, data2, formula, trim = NULL) {
+
+  data$heart_attack_incident <- data2$heart_attack_incident
+
+  model_ps <- glm(formula,
+                  data = data,
+                  family = binomial)
+
+  data$ps <- predict(model_ps,
+                     type = "response")
+
+  if (!is.null(trim))
+    data <- data %>%
+      filter(ps >= trim &
+             ps <= (1 - trim))
+
+  p_statin <- mean(data$statin == 1,
+                   na.rm = TRUE)
+
+  data <- data %>%
+    mutate(
+      w_stab = case_when(
+        statin == 1 ~ p_statin / ps,
+        statin == 0 ~ (1 - p_statin) / (1 - ps),
+        TRUE ~ NA_real_
+      )
+    )
+
+  model <- glm(
+    heart_attack_incident ~ statin,
+    data = data,
+    weights = w_stab,
+    family = binomial(link = "log")
+  )
+
+  c(
+    est = unname(coef(model)["statin1"]),
+    se  = unname(
+      sqrt(vcov(model)["statin1",
+                       "statin1"])
+    )
+  )
+}
+```
+
+
+```{r, warning=F}
+#IPW for each imputed dataset
+#with bmi
+ipw_res <- map_df(
+  .x = list(df1,df2,df3,df4,df5),
+  .f = ~ipw_mice(data = .x, formula = statin ~ bmi + age + education + health_insurance + physical_activity + gender, data2 = df_work_age_filter)
+) # apply IPW across all 5 imputed datasets
+
+ipw_bmi <- get_pooled(ipw_res$est, ipw_res$se) # pool estimates with Rubin's rules
+exp(ipw_bmi[c("Estimate","CI_lower","CI_upper")]) # report risk ratio
+```
+
+
+```{r, warning=F}
+#without bmi
+ipw_res2 <- map_df(
+  .x = list(df1,df2,df3,df4,df5),
+  .f = ~ipw_mice(data = .x, formula = statin ~ age + education + health_insurance + physical_activity + gender, data2 = df_work_age_filter)
+) # apply IPW across all 5 imputed datasets, excluding bmi from propensity model
+
+ipw_nobmi <- get_pooled(ipw_res2$est, ipw_res2$se) # pool estimates with Rubin's rules
+exp(ipw_nobmi[c("Estimate","CI_lower","CI_upper")]) # report risk ratio
+```
+
+```{r}
+#without bmi and trimmed
+ipw_res3 <- map_df(
+  .x = list(df1,df2,df3,df4,df5),
+  .f = ~ipw_mice(data = .x, trim = 0.3, formula = statin ~ age + education + health_insurance + physical_activity + gender, data2 = df_work_age_filter)
+) # apply IPW with propensity score trimming at 0.3 to address near-violations of positivity
+
+ipw_trim <- get_pooled(ipw_res3$est, ipw_res3$se) # pool estimates with Rubin's rules
+exp(ipw_trim[c("Estimate","CI_lower","CI_upper")]) # report risk ratio
+```
+
+----------------
+
+# Estimation 3
+## Use AIPW to find the risk ratio
+```{r}
+get_aipw <- function(data, outcome, formula, ps_formula) { # doubly-robust AIPW estimator; consistent if either the outcome model or propensity score model is correctly specified
+
+  data$heart_attack_incident <- outcome # attach outcome from original (pre-imputation) data
+
+  model_Y  <- glm(formula,    data = data, family = binomial) # outcome model
+  model_ps <- glm(ps_formula, data = data, family = binomial) # propensity score model
+
+  ps_hat <- predict(model_ps, type = "response") # estimated propensity scores
+  
+  d1 <- data %>% mutate(statin = factor(1, levels = levels(data$statin))) 
+  d0 <- data %>% mutate(statin = factor(0, levels = levels(data$statin))) 
+
+  mu1 <- predict(model_Y, newdata = d1, type = "response") # predicted outcome under treatment
+  mu0 <- predict(model_Y, newdata = d0, type = "response") # predicted outcome under control
+
+  A <- as.numeric(as.character(data$statin))
+  Y <- data$heart_attack_incident
+
+  eif1 <- mu1 + A       * (Y - mu1) / ps_hat        # efficient influence function for E[Y(1)]
+  eif0 <- mu0 + (1 - A) * (Y - mu0) / (1 - ps_hat)  # efficient influence function for E[Y(0)]
+
+  p1 <- mean(eif1, na.rm = TRUE) # AIPW estimate of E[Y(1)]
+  p0 <- mean(eif0, na.rm = TRUE) # AIPW estimate of E[Y(0)]
+  n  <- sum(!is.na(eif1) & !is.na(eif0))
+
+  if_rr <- eif1 / p0 - p1 * eif0 / p0^2 # delta-method influence function for the RR
+
+  c(est = p1 / p0,
+    se  = sd(if_rr, na.rm = TRUE) / sqrt(n)) # return RR and SE derived from influence function
+}
+```
+
+## AIPW with bmi
+```{r}
+aipw_res <- map_df(
+  .x = list(df1,df2,df3,df4,df5),
+  .f = ~get_aipw(
+    data       = .x,
+    outcome    = df_work_age_filter$heart_attack_incident,
+    formula    = heart_attack_incident ~ statin + bmi + age + education + health_insurance + physical_activity + gender,
+    ps_formula = statin ~ bmi + age + education + health_insurance + physical_activity + gender
+  )
+) # apply AIPW across all 5 imputed datasets
+
+aipw_bmi <- get_pooled(aipw_res$est, aipw_res$se) # pool RR estimates 
+aipw_bmi
+```
+
+## AIPW without bmi: no BMI - this estimator is for the primary analysis of AIPW with the initial adjustment set
+```{r}
+aipw_res2 <- map_df(
+  .x = list(df1,df2,df3,df4,df5),
+  .f = ~get_aipw(
+    data       = .x,
+    outcome    = df_work_age_filter$heart_attack_incident,
+    formula    = heart_attack_incident ~ statin + age + education + health_insurance + physical_activity + gender,
+    ps_formula = statin ~ age + education + health_insurance + physical_activity + gender
+  )
+) # apply AIPW across all 5 imputed datasets, excluding bmi from both models
+
+aipw_nobmi <- get_pooled(aipw_res2$est, aipw_res2$se) # pool RR estimates 
+aipw_nobmi
+```
+
+## Summary table
+
+```{r}
+summary_table <- data.frame(
+  method   = c("stdr_bmi","stdr_nobmi","IPW_bmi","IPW_nobmi","IPW_trim","AIPW_bmi","AIPW_nobmi"),
+  estimate = round(c(stdr_bmi$RR, stdr_nobmi$RR, exp(ipw_bmi["Estimate"]), exp(ipw_nobmi["Estimate"]), exp(ipw_trim["Estimate"]), aipw_bmi["Estimate"], aipw_nobmi["Estimate"]), 3),
+  low      = round(c(stdr_bmi$CI[1], stdr_nobmi$CI[1], exp(ipw_bmi["CI_lower"]), exp(ipw_nobmi["CI_lower"]), exp(ipw_trim["CI_lower"]), aipw_bmi["CI_lower"], aipw_nobmi["CI_lower"]), 3),
+  upper    = round(c(stdr_bmi$CI[2], stdr_nobmi$CI[2], exp(ipw_bmi["CI_upper"]), exp(ipw_nobmi["CI_upper"]), exp(ipw_trim["CI_upper"]), aipw_bmi["CI_upper"], aipw_nobmi["CI_upper"]), 3),
+  row.names = NULL
+) # compile RR point estimates and 95% CIs across all estimation methods
+
+```
+
+```{r}
+summary_table %>%
+  mutate(
+    type = str_detect(method, pattern = "nobmi"),     # flag models excluding bmi
+    type_est = ifelse(str_detect(method, pattern = "^stdr"),1,
+                      ifelse(str_detect(method, pattern = "^AIPW"),2,
+                             ifelse(str_detect(method, pattern = "^IPW"),3,NA))), # classify estimation method for faceting: 1=standardization, 2=AIPW, 3=IPW
+
+    type_est = as.factor(type_est)
+    ) %>%
+  ggplot() +
+  geom_pointrange(aes(x = estimate, y = method, xmin = low, xmax = upper, col = type)) +
+  geom_vline(aes(xintercept = 1),linetype = "dashed") + # reference line at RR = 1 (null effect)
+  facet_grid(type_est ~ ., scales = "free_y", space = "free_y") + # separate panels by estimation method
+
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    strip.text = element_blank()
+  )
+
+ggsave("./fig1.png", dpi = 300, bg = "white") # save forest plot
+```
+
+--------------------------------------------------
+
+# Sensitivity analysis
+
+## E-values
+
+```{r}
+# E-values computed using the OR formulation with rare=TRUE,
+# which approximates RR for relatively rare outcomes.
+
+summary_table %>%
+  group_by(method) %>%
+  nest() %>%
+  mutate(
+    Evalue = map(.x = data,
+                 .f = ~evalues.RR(est = .x$estimate, lo = .x$low, hi = .x$upper)), # compute E-value for each method's RR estimate
+
+    Evalue_est = map_dbl(.x = Evalue,
+                     .f =  ~.x[2,1]), # E-value for point estimate
+
+    Evalue_ci = map_dbl(.x = Evalue,
+                     .f =  ~.x[2,3]) # E-value for CI bound closest to null
+    ) %>%
+
+  unnest(data) %>%
+  select(method, estimate, low, upper, Evalue_est, Evalue_ci)
+```
+```{r}
+ls("package:EValue")
+
+```
+
+----------------------------------------
+# Diagnostics:
+## Diagnostics 1: Propensity overlap to check propensity score overlaping for 
+## treatment and control group before and after weighting in IPW with the first 
+## imputated dataset based on the dataset filtered by age > 50.
+```{r}
+# Use first imputed dataset for diagnostics
+# Use propensity overlap to examine common support (overlap) between treated and
+# untreated groups. Lack of overlap may indicate positivity violations and
+# unstable IPW estimates.
+df_diag <- df1
+
+model_ps_diag <- glm(
+  statin ~ age + education + gender + health_insurance + physical_activity,
+  data = df_diag,
+  family = binomial
+)
+
+df_diag$ps <- predict(
+  model_ps_diag,
+  type = "response"
+)
+
+p_statin <- mean(df_diag$statin == 1)
+
+df_diag <- df_diag %>%
+  mutate(
+    w_stab = case_when(
+      statin == 1 ~ p_statin / ps,
+      statin == 0 ~ (1 - p_statin) / (1 - ps)
+    )
+  )
+
+# Before weighting
+ggplot(
+  df_diag,
+  aes(
+    x = ps,
+    fill = statin
+  )
+) +
+  geom_histogram(
+    position = "identity",
+    alpha = 0.4,
+    bins = 30
+  ) +
+
+  labs(
+    title = "Propensity Score Distribution Before Weighting (Age > 50)",
+    x = "Propensity Score",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# After weighting
+ggplot(
+  df_diag,
+  aes(
+    x = ps,
+    fill = statin,
+    weight = w_stab
+  )
+) +
+  geom_histogram(
+    position = "identity",
+    alpha = 0.4,
+    bins = 30
+  ) +
+  labs(
+    title = "Propensity Score Distribution After Weighting (Age > 50)",
+    x = "Propensity Score",
+    y = "Weighted Count"
+  ) +
+  theme_minimal()
+```
+
+## Diagnostics 2: Love plot to check covariate balance before and after IPW
+## using df1 (df_diag) after age trimming (age > 50).
+```{r}
+# Covariate balance
+library(cobalt)
+
+bal_ipw <- bal.tab(
+  statin ~ age + education + gender + health_insurance + physical_activity,
+  data = df_diag,
+  weights = df_diag$w_stab,
+  method = "weighting",
+  un = TRUE
+)
+
+bal_ipw$Balance
+```
+
+```{r}
+# Draw love plot
+love.plot(
+  bal_ipw,
+  stats = "mean.diffs",
+  abs = TRUE,
+  threshold = 0.1,
+  var.order = "unadjusted"
+)+
+  labs(
+    title = "Covariate Balance Before and After IPW (Age > 50)"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
